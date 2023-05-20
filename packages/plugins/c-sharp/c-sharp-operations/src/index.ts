@@ -1,9 +1,17 @@
 import { extname } from 'path';
-import { concatAST, FragmentDefinitionNode, GraphQLSchema, Kind } from 'graphql';
+import {
+  concatAST,
+  EnumTypeDefinitionNode,
+  FragmentDefinitionNode,
+  GraphQLSchema,
+  InputObjectTypeDefinitionNode,
+  Kind,
+  OperationDefinitionNode,
+} from 'graphql';
 import gql from 'graphql-tag';
+import { CSharpDeclarationBlock } from '@graphql-codegen/c-sharp-common';
 import {
   getCachedDocumentNodeFromSchema,
-  oldVisit,
   PluginFunction,
   PluginValidateFn,
   Types,
@@ -32,29 +40,105 @@ export const plugin: PluginFunction<CSharpOperationsRawPluginConfig> = (
     })),
     ...(config.externalFragments || []),
   ];
-
+  //
+  const allOperations = allAst.definitions.filter(
+    d => d.kind === Kind.OPERATION_DEFINITION,
+  ) as OperationDefinitionNode[];
+  const allInputTypes = allAst.definitions.filter(
+    d => d.kind === Kind.INPUT_OBJECT_TYPE_DEFINITION,
+  ) as InputObjectTypeDefinitionNode[];
+  const allEnumTypes = allAst.definitions.filter(
+    d => d.kind === Kind.ENUM_TYPE_DEFINITION,
+  ) as EnumTypeDefinitionNode[];
   const visitor = new CSharpOperationsVisitor(schema, allFragments, config, documents);
-  const visitorResult = oldVisit(allAst, { leave: visitor });
+
+  let inputDefinitions = '';
+  allInputTypes.forEach(inputType => {
+    const inputDefinition = visitor.InputObjectTypeDefinition(inputType);
+    inputDefinitions += inputDefinition;
+    inputDefinitions += '\n';
+  });
+
+  let fragmentDefinitions = '';
+  allFragments.forEach(fragment => {
+    const fragmentDefinition = visitor.getFragmentClass(fragment.node);
+    fragmentDefinitions += fragmentDefinition;
+    fragmentDefinitions += '\n';
+  });
+
+  let operationInterfaceMethods = '';
+  allOperations.forEach(operation => {
+    const operationInterfaceMethod = visitor.getOperationInterfaceMethods(operation);
+    operationInterfaceMethods += operationInterfaceMethod;
+    operationInterfaceMethods += '\n';
+  });
+
+  let operationDefinitions = '';
+  allOperations.forEach(operation => {
+    const operationDefinition = visitor.getOperationConcreteMethod(operation);
+    operationDefinitions += operationDefinition;
+    operationDefinitions += '\n';
+  });
+
+  let requestDefinitions = '';
+  allOperations.forEach(operation => {
+    const requestDefinition = visitor.getRequestClass(operation);
+    requestDefinitions += requestDefinition;
+    requestDefinitions += '\n';
+  });
+
+  let responseDefinitions = '';
+  allOperations.forEach(operation => {
+    const responseDefinition = visitor.getResponseClass(operation);
+    responseDefinitions += responseDefinition;
+    responseDefinitions += '\n';
+  });
+
+  let enumDefinitions = '';
+  allEnumTypes.forEach(enumType => {
+    const enumDefinition = visitor.getEnumDefinition(enumType);
+    enumDefinitions += enumDefinition;
+    enumDefinitions += '\n';
+  });
+
+  const clientInterfaceName = 'I' + config.operationsClassName;
+
+  const clientInterface = new CSharpDeclarationBlock()
+    .access('public')
+    .asKind('interface')
+    .withName(clientInterfaceName)
+    .withBlock(operationInterfaceMethods).string;
+
+  const clientClass = new CSharpDeclarationBlock()
+    .access('public')
+    .asKind('class')
+    .withName(config.operationsClassName)
+    .implements([clientInterfaceName])
+    .withBlock([visitor.getClientDeclaration(), operationDefinitions].join('\n')).string;
+
+  const blockContent = [
+    clientInterface,
+    clientClass,
+    requestDefinitions,
+    responseDefinitions,
+    fragmentDefinitions,
+    inputDefinitions,
+    enumDefinitions,
+    visitor.getHttpRequestClass(),
+    visitor.getHasErrorExtension(),
+  ].join('\n');
+
+  const wrappedContent = visitor.wrapWithNamespace(blockContent, visitor.config.namespaceName);
+
   const imports = visitor.getCSharpImports();
-  const openNameSpace = `namespace ${visitor.config.namespaceName} {`;
-  return {
-    prepend: [],
-    content: [
-      imports,
-      openNameSpace,
-      ...visitorResult.definitions.filter(t => typeof t === 'string'),
-      '}',
-    ]
-      .filter(a => a)
-      .join('\n'),
-  };
+  return [imports, wrappedContent].join('\n');
 };
 
 export const addToSchema = gql`
   directive @namedClient(name: String!) on OBJECT | FIELD
 `;
 
-export const validate: PluginValidateFn<any> = async (
+export const validate: PluginValidateFn = async (
   schema: GraphQLSchema,
   documents: Types.DocumentFile[],
   config,

@@ -16,6 +16,17 @@ export interface CSharpOperationsRawPluginConfig extends RawClientSideBasePlugin
    */
   namespaceName?: string;
   /**
+   * @default GraphQLClient
+   * @description Allow you to customize the operations class name.
+   *
+   * @exampleMarkdown
+   * ```yaml
+   * config:
+   *   operationsClassName: MyCompanyGQLOperations
+   * ```
+   */
+  operationsClassName?: string;
+  /**
    * @description Defined the global value of `namedClient`.
    *
    * @exampleMarkdown
@@ -69,4 +80,23 @@ export interface CSharpOperationsRawPluginConfig extends RawClientSideBasePlugin
    * ```
    */
   typesafeOperation?: boolean;
+  /**
+   * @description Defines the HTTP GraphQL client endpoint to use
+   * @default []
+   *
+   * @exampleMarkdown
+   * ```yaml
+   * config:
+   *   httpClientConfig: {
+         prod: 'https://my-prod-endpoint.com/graphql',
+         dev: 'https://my-dev-endpoint.com/graphql',
+         useDevIf: 'UnityEngine.Debug.isDebugBuild'
+       }
+   * ```
+   */
+  httpClientConfig?: {
+    prodEndpoint: string;
+    devEndpoint: string;
+    useDevIf: string;
+  };
 }

@@ -1,9 +1,10 @@
 import autoBind from 'auto-bind';
+import { pascalCase } from 'change-case-all';
 import {
-  DirectiveNode,
   DocumentNode,
   EnumTypeDefinitionNode,
   FieldNode,
+  FragmentDefinitionNode,
   FragmentSpreadNode,
   GraphQLSchema,
   InputObjectTypeDefinitionNode,
@@ -16,9 +17,9 @@ import {
   print,
   TypeNode,
   VariableDefinitionNode,
-  visit,
 } from 'graphql';
 import {
+  Access,
   C_SHARP_SCALARS,
   convertSafeName,
   CSharpDeclarationBlock,
@@ -36,40 +37,32 @@ import {
   ClientSideBaseVisitor,
   DocumentMode,
   getBaseTypeNode,
-  indent,
   indentMultiline,
   LoadedFragment,
 } from '@graphql-codegen/visitor-plugin-common';
 import { CSharpOperationsRawPluginConfig } from './config.js';
 
 const defaultSuffix = 'GQL';
-const R_NAME = /name:\s*"([^"]+)"/;
-
-function R_DEF(directive: string) {
-  return new RegExp(`\\s+\\@${directive}\\([^)]+\\)`, 'gm');
-}
 
 export interface CSharpOperationsPluginConfig extends ClientSideBasePluginConfig {
   namespaceName: string;
+  operationsClassName: string;
   namedClient: string;
   querySuffix: string;
   mutationSuffix: string;
   subscriptionSuffix: string;
   typesafeOperation: boolean;
+  httpClientConfig?: {
+    prodEndpoint: string;
+    devEndpoint: string;
+    useDevIf: string;
+  };
 }
 
 export class CSharpOperationsVisitor extends ClientSideBaseVisitor<
   CSharpOperationsRawPluginConfig,
   CSharpOperationsPluginConfig
 > {
-  private _operationsToInclude: {
-    node: OperationDefinitionNode;
-    documentVariableName: string;
-    operationType: string;
-    operationResultType: string;
-    operationVariablesTypes: string;
-  }[] = [];
-
   private _schemaAST: DocumentNode;
 
   constructor(
@@ -84,76 +77,41 @@ export class CSharpOperationsVisitor extends ClientSideBaseVisitor<
       rawConfig,
       {
         namespaceName: rawConfig.namespaceName || 'GraphQLCodeGen',
+        operationsClassName: rawConfig.operationsClassName || 'GraphQLClient',
         namedClient: rawConfig.namedClient,
         querySuffix: rawConfig.querySuffix || defaultSuffix,
         mutationSuffix: rawConfig.mutationSuffix || defaultSuffix,
         subscriptionSuffix: rawConfig.subscriptionSuffix || defaultSuffix,
         scalars: buildScalarsFromConfig(schema, rawConfig, C_SHARP_SCALARS),
         typesafeOperation: rawConfig.typesafeOperation || false,
+        httpClientConfig: rawConfig.httpClientConfig ?? undefined,
       },
       documents,
     );
 
-    this.overruleConfigSettings();
+    if (this.config.documentMode === DocumentMode.graphQLTag) {
+      // C# operations does not (yet) support graphQLTag mode
+      this.config.documentMode = DocumentMode.documentNode;
+    }
+
     autoBind(this);
 
     this._schemaAST = getCachedDocumentNodeFromSchema(schema);
   }
 
-  // Some settings aren't supported with C#, overruled here
-  private overruleConfigSettings() {
-    if (this.config.documentMode === DocumentMode.graphQLTag) {
-      // C# operations does not (yet) support graphQLTag mode
-      this.config.documentMode = DocumentMode.documentNode;
-    }
+  public wrapWithNamespace(content: string, name: string): string {
+    return new CSharpDeclarationBlock()
+      .asKind('namespace')
+      .withName(name)
+      .withBlock(indentMultiline(content)).string;
   }
 
-  private _operationHasDirective(operation: string | OperationDefinitionNode, directive: string) {
-    if (typeof operation === 'string') {
-      return operation.includes(`${directive}`);
-    }
-
-    let found = false;
-
-    visit(operation, {
-      Directive(node) {
-        if (node.name.value === directive) {
-          found = true;
-        }
-      },
-    });
-
-    return found;
-  }
-
-  private _extractDirective(operation: OperationDefinitionNode, directive: string) {
-    const directives = print(operation).match(R_DEF(directive));
-
-    if (directives.length > 1) {
-      throw new Error(
-        `The ${directive} directive used multiple times in '${operation.name}' operation`,
-      );
-    }
-
-    return directives[0];
-  }
-
-  private _namedClient(operation: OperationDefinitionNode): string {
-    let name: string;
-
-    if (this._operationHasDirective(operation, 'namedClient')) {
-      name = this._extractNamedClient(operation);
-    } else if (this.config.namedClient) {
-      name = this.config.namedClient;
-    }
-
-    return name ? `client = '${name}';` : '';
-  }
-
-  private _extractNamedClient(operation: OperationDefinitionNode): string {
-    const [, name] = this._extractDirective(operation, 'namedClient').match(R_NAME);
-
-    return name;
+  public wrapWithClass(content: string, name: string, access: Access = 'public'): string {
+    return new CSharpDeclarationBlock()
+      .access(access)
+      .asKind('class')
+      .withName(convertSafeName(name))
+      .withBlock(indentMultiline(content)).string;
   }
 
   protected _gql(node: OperationDefinitionNode): string {
@@ -165,13 +123,13 @@ export class CSharpOperationsVisitor extends ClientSideBaseVisitor<
     return doc.replace(/"/g, '""');
   }
 
-  private _getDocumentNodeVariable(
-    node: OperationDefinitionNode,
-    documentVariableName: string,
-  ): string {
-    return this.config.documentMode === DocumentMode.external
-      ? `Operations.${node.name.value}`
-      : documentVariableName;
+  private _getDocumentNodeVariable(node: OperationDefinitionNode): string {
+    if (this.config.documentMode !== DocumentMode.external) {
+      const gqlBlock = indentMultiline(this._gql(node), 4);
+      return `@"\n${gqlBlock}"`;
+    } else {
+      return `Operations.${node.name.value}`;
+    }
   }
 
   private _gqlInputSignature(variable: VariableDefinitionNode): {
@@ -199,24 +157,97 @@ export class CSharpOperationsVisitor extends ClientSideBaseVisitor<
   }
 
   public getCSharpImports(): string {
-    return (
-      ['System', 'Newtonsoft.Json', 'GraphQL', 'GraphQL.Client.Abstractions']
-        .map(i => `using ${i};`)
-        .join('\n') + '\n'
-    );
+    let imports = [
+      'System',
+      'System.Collections.Generic',
+      'System.Threading.Tasks',
+      'System.Net.Http',
+      'System.Net.Http.Headers',
+      'Newtonsoft.Json',
+      'GraphQL',
+      'GraphQL.Client.Abstractions',
+    ];
+
+    if (this.config.httpClientConfig) {
+      imports = imports.concat(['GraphQL.Client.Serializer.Newtonsoft', 'GraphQL.Client.Http']);
+    }
+
+    return imports.map(i => `using ${i};`).join('\n') + '\n';
   }
 
-  private _operationSuffix(operationType: string): string {
-    switch (operationType) {
-      case 'query':
-        return this.config.querySuffix;
-      case 'mutation':
-        return this.config.mutationSuffix;
-      case 'subscription':
-        return this.config.subscriptionSuffix;
-      default:
-        return defaultSuffix;
+  public getClientDeclaration(): string {
+    if (!this.config.httpClientConfig) return '';
+
+    const { prodEndpoint, devEndpoint, useDevIf } = this.config.httpClientConfig;
+    if (!prodEndpoint) return '';
+
+    // let clientDeclaration = `public partial class ${this.config.operationsClassName} {\n`;
+
+    let clientDeclaration = `private static GraphQLHttpClient _client;\n`;
+
+    if (!useDevIf || !devEndpoint) {
+      clientDeclaration += `private static GraphQLHttpClient client {
+          get {
+            if (_client == null) {
+              _client = new GraphQLHttpClient("${prodEndpoint}", new NewtonsoftJsonSerializer());
+            }
+
+            return _client;
+          }
+        }`;
+    } else {
+      clientDeclaration += `private static GraphQLHttpClient client {
+          get {
+            if (_client == null) {
+              var endpoint = ${useDevIf} ? "${devEndpoint}" : "${prodEndpoint}";
+              _client = new GraphQLHttpClient(endpoint, new NewtonsoftJsonSerializer());
+            }
+
+            return _client;
+          }
+        }`;
     }
+
+    // clientDeclaration += `\n}`;
+
+    return clientDeclaration;
+  }
+
+  public getHttpRequestClass() {
+    if (!this.config.httpClientConfig) return '';
+
+    return `
+    internal class GraphQLHttpRequestWithHeaders : GraphQLHttpRequest {
+      public string AuthToken { get; set; }
+      public Dictionary<string, string> Headers { get; set; }
+
+      public override HttpRequestMessage ToHttpRequestMessage(
+          GraphQLHttpClientOptions options,
+          IGraphQLJsonSerializer serializer) {
+          var r = base.ToHttpRequestMessage(options, serializer);
+
+          if (AuthToken != null) {
+              r.Headers.Authorization = new AuthenticationHeaderValue("Bearer", AuthToken);
+          }
+
+          if (Headers != null) {
+              foreach (var h in Headers) {
+                  r.Headers.Add(h.Key, h.Value);
+              }
+          }
+
+          return r;
+      }
+    }`;
+  }
+
+  public getHasErrorExtension() {
+    return `
+    public static class GraphQLResponseExtensions {
+        public static bool HasError<T>(this GraphQLResponse<T> response) {
+            return response.Errors != null;
+        }
+    }`;
   }
 
   protected resolveFieldType(
@@ -288,181 +319,365 @@ export class CSharpOperationsVisitor extends ClientSideBaseVisitor<
     return result;
   }
 
-  private _getResponseFieldRecursive(
-    node: OperationDefinitionNode | FieldNode | FragmentSpreadNode | DirectiveNode,
-    parentSchema: ObjectTypeDefinitionNode,
-  ): string {
-    switch (node.kind) {
-      case Kind.OPERATION_DEFINITION: {
-        return new CSharpDeclarationBlock()
-          .access('public')
-          .asKind('class')
-          .withName('Response')
-          .withBlock(
-            '\n' +
-              node.selectionSet.selections
-                .map(opr => {
-                  if (opr.kind !== Kind.FIELD) {
-                    throw new Error(`Unknown kind; ${opr.kind} in OperationDefinitionNode`);
-                  }
-                  return this._getResponseFieldRecursive(opr, parentSchema);
-                })
-                .join('\n'),
-          ).string;
-      }
-      case Kind.FIELD: {
-        const fieldSchema = parentSchema.fields.find(f => f.name.value === node.name.value);
-        if (!fieldSchema) {
-          throw new Error(`Field schema not found; ${node.name.value}`);
-        }
-        const responseType = this.resolveFieldType(fieldSchema.type);
+  private _getFieldDefinition(node: FieldNode, parentSchema: ObjectTypeDefinitionNode): string {
+    const fieldSchema = parentSchema.fields.find(f => f.name.value === node.name.value);
+    if (!fieldSchema) {
+      throw new Error(`Field schema not found; ${node.name.value}`);
+    }
+    const responseType = this.resolveFieldType(fieldSchema.type);
 
-        if (!node.selectionSet) {
-          const responseTypeName = wrapFieldType(
-            responseType,
-            responseType.listType,
-            'System.Collections.Generic.List',
-          );
-          return indentMultiline(
-            [
-              `[JsonProperty("${node.name.value}")]`,
-              `public ${responseTypeName} ${convertSafeName(node.name.value)} { get; set; }`,
-            ].join('\n') + '\n',
-          );
-        }
-        const selectionBaseTypeName = `${responseType.baseType.type}Selection`;
-        const selectionType = Object.assign(new CSharpFieldType(responseType), {
-          baseType: { type: selectionBaseTypeName },
-        });
-        const selectionTypeName = wrapFieldType(
-          selectionType,
-          selectionType.listType,
-          'System.Collections.Generic.List',
-        );
-        const innerClassSchema = this._schemaAST.definitions.find(
-          d =>
-            d.kind === Kind.OBJECT_TYPE_DEFINITION && d.name.value === responseType.baseType.type,
-        ) as ObjectTypeDefinitionNode;
+    if (!node.selectionSet) {
+      const responseTypeName = wrapFieldType(responseType, responseType.listType, 'List');
+      return indentMultiline(
+        [
+          `[JsonProperty("${node.name.value}")]`,
+          `public ${responseTypeName} ${convertSafeName(
+            pascalCase(node.name.value),
+          )} { get; set; }`,
+        ].join('\n') + '\n',
+      );
+    }
+    // const selectionBaseTypeName = this._getResponseDataClassName();
 
-        const innerClassDefinition = new CSharpDeclarationBlock()
-          .access('public')
-          .asKind('class')
-          .withName(convertSafeName(selectionBaseTypeName))
-          .withBlock(
-            '\n' +
-              node.selectionSet.selections
-                .map(s => {
-                  if (s.kind === Kind.INLINE_FRAGMENT) {
-                    throw new Error(`Unsupported kind; ${node.name} ${s.kind}`);
-                  }
-                  return this._getResponseFieldRecursive(s, innerClassSchema);
-                })
-                .join('\n'),
-          ).string;
-        return indentMultiline(
-          [
-            innerClassDefinition,
-            `[JsonProperty("${node.name.value}")]`,
-            `public ${selectionTypeName} ${convertSafeName(node.name.value)} { get; set; }`,
-          ].join('\n') + '\n',
-        );
+    const innerClassSchema = this._schemaAST.definitions.find(
+      d => d.kind === Kind.OBJECT_TYPE_DEFINITION && d.name.value === responseType.baseType.type,
+    ) as ObjectTypeDefinitionNode;
+
+    if (
+      node.selectionSet.selections.length === 1 &&
+      node.selectionSet.selections[0].kind === Kind.FRAGMENT_SPREAD
+    ) {
+      const fragmentNode = node.selectionSet.selections[0];
+      let responseTypeName = this._getFragmentClassName(fragmentNode);
+      let responseVariableName: string;
+      if (responseType.listType) {
+        responseVariableName = responseTypeName + 's';
+        responseTypeName = `List<${responseTypeName}>`;
+      } else {
+        responseVariableName = responseTypeName;
       }
-      case Kind.FRAGMENT_SPREAD: {
-        const fragmentSchema = this._fragments.find(f => f.name === node.name.value);
-        if (!fragmentSchema) {
-          throw new Error(`Fragment schema not found; ${node.name.value}`);
-        }
-        return fragmentSchema.node.selectionSet.selections
-          .map(s => {
-            if (s.kind === Kind.INLINE_FRAGMENT) {
-              throw new Error(`Unsupported kind; ${node.name} ${s.kind}`);
-            }
-            return this._getResponseFieldRecursive(s, parentSchema);
-          })
-          .join('\n');
+      return indentMultiline(
+        [
+          `[JsonProperty("${node.name.value}")]`,
+          `public ${responseTypeName} ${responseVariableName} { get; set; }`,
+        ].join('\n') + '\n',
+      );
+    } else {
+      const selectionFields = node.selectionSet.selections
+        .map(s => {
+          if (s.kind === Kind.INLINE_FRAGMENT) {
+            throw new Error(`Unsupported kind; ${node.name} ${s.kind}`);
+          } else if (s.kind === Kind.FRAGMENT_SPREAD) {
+            return this._getFragmentSpreadDefinition(s, innerClassSchema);
+          } else {
+            return this._getFieldDefinition(s, innerClassSchema);
+          }
+        })
+        .join('\n');
+
+      const fieldType = new CSharpFieldType(responseType);
+
+      let baseTypeName = pascalCase(node.name.value);
+      if (fieldType.listType && baseTypeName.endsWith('s')) {
+        baseTypeName = baseTypeName.slice(0, -1);
       }
-      default: {
-        return '';
-      }
+
+      baseTypeName += 'Result';
+      baseTypeName = convertSafeName(baseTypeName);
+
+      const selectionType = Object.assign(fieldType, {
+        baseType: { type: baseTypeName },
+      });
+
+      const selectionTypeName = wrapFieldType(selectionType, selectionType.listType, 'List');
+
+      const innerClassDefinition = new CSharpDeclarationBlock()
+        .access('public')
+        .asKind('class')
+        .withName(baseTypeName)
+        .withBlock(selectionFields).string;
+
+      return indentMultiline(
+        [
+          innerClassDefinition,
+          `[JsonProperty("${node.name.value}")]`,
+          `public ${selectionTypeName} Result { get; set; }`,
+        ].join('\n') + '\n',
+      );
     }
   }
 
-  private _getResponseClass(node: OperationDefinitionNode): string {
+  private _getFragmentSpreadDefinition(
+    node: FragmentSpreadNode,
+    parentSchema: ObjectTypeDefinitionNode,
+  ): string {
+    const fragmentSchema = this._fragments.find(f => f.name === node.name.value);
+    if (!fragmentSchema) {
+      throw new Error(`Fragment schema not found; ${node.name.value}`);
+    }
+    return fragmentSchema.node.selectionSet.selections
+      .map(s => {
+        if (s.kind === Kind.INLINE_FRAGMENT) {
+          throw new Error(`Unsupported kind; ${node.name} ${s.kind}`);
+        } else if (s.kind === Kind.FIELD) {
+          return this._getFieldDefinition(s, parentSchema);
+        } else {
+          return this._getFragmentSpreadDefinition(s, parentSchema);
+        }
+      })
+      .join('\n');
+  }
+
+  private _getResponseClassName(node: OperationDefinitionNode): string {
+    let className = `${this.convertName(node)}Payload`;
+
+    if (className.startsWith('Get')) {
+      className = className.slice(3);
+    }
+
+    return className;
+  }
+
+  private _getVariablesClassName(node: OperationDefinitionNode): string {
+    return `${this.convertName(node)}Request`;
+  }
+
+  public getResponseClass(node: OperationDefinitionNode): string {
     const operationSchema = this._schemaAST.definitions.find(
       s => s.kind === Kind.OBJECT_TYPE_DEFINITION && s.name.value.toLowerCase() === node.operation,
     );
-    return this._getResponseFieldRecursive(node, operationSchema as ObjectTypeDefinitionNode);
-  }
 
-  private _getVariablesClass(node: OperationDefinitionNode): string {
-    if (!node.variableDefinitions?.length) {
-      return '';
-    }
     return new CSharpDeclarationBlock()
       .access('public')
       .asKind('class')
-      .withName('Variables')
+      .withName(this._getResponseClassName(node))
       .withBlock(
         '\n' +
-          node.variableDefinitions
-            ?.map(v => {
-              const inputType = this.resolveFieldType(v.type);
-              const inputTypeName = wrapFieldType(
-                inputType,
-                inputType.listType,
-                'System.Collections.Generic.List',
-              );
-              return indentMultiline(
-                [
-                  `[JsonProperty("${v.variable.name.value}")]`,
-                  `public ${inputTypeName} ${convertSafeName(v.variable.name.value)} { get; set; }`,
-                ].join('\n') + '\n',
-              );
+          node.selectionSet.selections
+            .map(opr => {
+              if (opr.kind !== Kind.FIELD) {
+                throw new Error(`Unknown kind; ${opr.kind} in OperationDefinitionNode`);
+              }
+
+              return this._getFieldDefinition(opr, operationSchema as ObjectTypeDefinitionNode);
             })
             .join('\n'),
       ).string;
   }
 
-  private _getOperationMethod(node: OperationDefinitionNode): string {
+  private _getFragmentClassName(node: FragmentSpreadNode): string {
+    return this.convertName(node);
+  }
+
+  public getFragmentClass(node: FragmentDefinitionNode): string {
+    const fragmentSchema = this._schemaAST.definitions.find(
+      s => s.kind === Kind.OBJECT_TYPE_DEFINITION && s.name.value === node.typeCondition.name.value,
+    );
+
+    return new CSharpDeclarationBlock()
+      .access('public')
+      .asKind('class')
+      .withName(this.convertName(node))
+      .withBlock(
+        '\n' +
+          node.selectionSet.selections
+            .map(opr => {
+              if (opr.kind !== Kind.FIELD) {
+                throw new Error(`Unknown kind; ${opr.kind} in OperationDefinitionNode`);
+              }
+              return this._getFieldDefinition(opr, fragmentSchema as ObjectTypeDefinitionNode);
+            })
+            .join('\n'),
+      ).string;
+  }
+
+  public getRequestClass(node: OperationDefinitionNode): string {
+    if (!node.variableDefinitions?.length) {
+      return '';
+    }
+
+    const fields =
+      '\n' +
+      node.variableDefinitions
+        ?.map(v => {
+          const inputType = this.resolveFieldType(v.type);
+          const inputTypeName = wrapFieldType(inputType, inputType.listType, 'List');
+          const inputVariableName = convertSafeName(pascalCase(v.variable.name.value));
+
+          return indentMultiline(
+            [
+              `[JsonProperty("${v.variable.name.value}")]`,
+              `public ${inputTypeName} ${inputVariableName} { get; set; }`,
+            ].join('\n') + '\n',
+          );
+        })
+        .join('\n');
+
+    let constructorParams = '';
+
+    for (let i = 0; i < node.variableDefinitions.length; i++) {
+      const variable = node.variableDefinitions[i];
+      const inputType = this.resolveFieldType(variable.type);
+      const inputTypeName = wrapFieldType(inputType, inputType.listType, 'List');
+      const inputName = convertSafeName(variable.variable.name.value);
+
+      constructorParams += `${inputTypeName} ${inputName}`;
+
+      if (i < node.variableDefinitions.length - 1) {
+        constructorParams += ', ';
+      }
+    }
+
+    let constructor = `public ${this._getVariablesClassName(node)}(${constructorParams}) {`;
+
+    for (let i = 0; i < node.variableDefinitions.length; i++) {
+      const variable = node.variableDefinitions[i];
+      const inputName = convertSafeName(variable.variable.name.value);
+      const inputVariableName = convertSafeName(pascalCase(variable.variable.name.value));
+
+      constructor += `\n  ${inputVariableName} = ${inputName};`;
+    }
+
+    constructor += '\n}';
+
+    const contents = [fields, constructor].join('\n');
+
+    return new CSharpDeclarationBlock()
+      .access('public')
+      .asKind('class')
+      .withName(this._getVariablesClassName(node))
+      .withBlock(contents).string;
+  }
+
+  public getEnumDefinition(node: EnumTypeDefinitionNode): string {
+    const enumDefinition = new CSharpDeclarationBlock()
+      .access('public')
+      .asKind('enum')
+      .withName(convertSafeName(this.convertName(node.name)))
+      .withBlock(indentMultiline(node.values?.map(v => v.name.value).join(',\n'))).string;
+
+    return indentMultiline(enumDefinition, 2);
+  }
+
+  public getOperationInterfaceMethods(node: OperationDefinitionNode): string {
+    switch (node.operation) {
+      case 'query':
+      case 'mutation':
+        return `${this.getMutationMethodDefinition(node)};`;
+      case 'subscription': {
+        return `${this.getSubscriptionMethodDefinition(node)};
+                ${this.getSubscriptionMethodDefinitionWithHandler(node)};`;
+      }
+    }
+    throw new Error(`Unexpected operation type: ${node.operation}`);
+  }
+
+  private variablesObjectName = 'request';
+  private clientArgument = this.config.httpClientConfig ? '' : 'IGraphQLClient client, ';
+  private httpArguments = 'string authToken = "", Dictionary<string, string> headers = null';
+
+  private getVariablesArguments(node: OperationDefinitionNode): string {
+    return node.variableDefinitions?.length
+      ? `${this._getVariablesClassName(node)} ${this.variablesObjectName}, `
+      : '';
+  }
+  private getMutationMethodDefinition(node: OperationDefinitionNode): string {
+    return `Task<GraphQLResponse<${this._getResponseClassName(node)}>> ${this.convertName(
+      node,
+    )}Async(
+                  ${this.clientArgument}
+                  ${this.getVariablesArguments(node)}
+                  ${this.config.httpClientConfig ? `${this.httpArguments}, ` : ''}
+                  System.Threading.CancellationToken cancellationToken = default
+                )`;
+  }
+
+  private getSubscriptionMethodDefinition(node: OperationDefinitionNode): string {
+    return `IObservable<GraphQLResponse<${this._getResponseClassName(
+      node,
+    )}>> CreateSubscriptionStream(
+                  ${this.clientArgument}
+                  ${this.getVariablesArguments(node)}
+                  ${this.config.httpClientConfig ? this.httpArguments : ''}
+            )`;
+  }
+
+  private getSubscriptionMethodDefinitionWithHandler(node: OperationDefinitionNode): string {
+    return `IObservable<GraphQLResponse<${this._getResponseClassName(
+      node,
+    )}>> CreateSubscriptionStream(
+                  ${this.clientArgument}
+                  ${this.getVariablesArguments(node)}
+                  Action<Exception> exceptionHandler
+                  ${this.config.httpClientConfig ? `, ${this.httpArguments}` : ''}
+            )`;
+  }
+
+  public getOperationConcreteMethod(node: OperationDefinitionNode): string {
     const operationSchema = this._schemaAST.definitions.find(
       s => s.kind === Kind.OBJECT_TYPE_DEFINITION && s.name.value.toLowerCase() === node.operation,
     ) as ObjectTypeDefinitionNode;
+
     if (!operationSchema) {
       throw new Error(`Operation schema not found; ${node.operation}`);
     }
 
-    const variablesArgument = node.variableDefinitions?.length ? ', Variables variables' : '';
+    const inputSignatures = node.variableDefinitions?.map(v => this._gqlInputSignature(v));
+    const hasInputArgs = !!inputSignatures?.length;
+
+    let request: string;
+
+    if (this.config.httpClientConfig) {
+      request = `
+      var gqlRequest = new GraphQLHttpRequestWithHeaders {
+          Query = ${this._getDocumentNodeVariable(node)},
+          AuthToken = authToken,
+          Headers = headers,
+          OperationName = "${node.name.value}"${
+        hasInputArgs
+          ? `,
+          Variables = ${this.variablesObjectName}`
+          : ''
+      }
+      };`;
+    } else {
+      request = `
+      var gqlRequest = new GraphQLRequest {
+          Query = ${this._getDocumentNodeVariable(node)},
+          OperationName = "${node.name.value}"${
+        hasInputArgs
+          ? `,
+          Variables = ${this.variablesObjectName}`
+          : ''
+      }
+      };`;
+    }
 
     switch (node.operation) {
       case 'query':
       case 'mutation':
-        return [
-          `public static System.Threading.Tasks.Task<GraphQLResponse<Response>> Send${operationSchema.name.value}Async(IGraphQLClient client${variablesArgument}, System.Threading.CancellationToken cancellationToken = default) {`,
-          indent(
-            `return client.Send${operationSchema.name.value}Async<Response>(Request(${
-              node.variableDefinitions?.length ? 'variables' : ''
-            }), cancellationToken);`,
-          ),
-          `}`,
-        ].join('\n');
+        return `
+          public ${this.getMutationMethodDefinition(node)} {
+            ${request}
+            return client.Send${operationSchema.name.value}Async<${this._getResponseClassName(
+          node,
+        )}>(gqlRequest, cancellationToken);
+          }
+        `;
       case 'subscription': {
-        return [
-          `public static System.IObservable<GraphQLResponse<Response>> CreateSubscriptionStream(IGraphQLClient client${variablesArgument}) {`,
-          indent(
-            `return client.CreateSubscriptionStream<Response>(Request(${
-              node.variableDefinitions?.length ? 'variables' : ''
-            }));`,
-          ),
-          `}`,
-          '',
-          `public static System.IObservable<GraphQLResponse<Response>> CreateSubscriptionStream(IGraphQLClient client${variablesArgument}, System.Action<System.Exception> exceptionHandler) {`,
-          indent(
-            `return client.CreateSubscriptionStream<Response>(Request(${
-              node.variableDefinitions?.length ? 'variables' : ''
-            }), exceptionHandler);`,
-          ),
-          `}`,
-        ].join('\n');
+        return `
+          public ${this.getSubscriptionMethodDefinition(node)} {
+            ${request}
+            return client.CreateSubscriptionStream<${this._getResponseClassName(node)}>(gqlRequest);
+          }
+
+          public ${this.getSubscriptionMethodDefinitionWithHandler(node)} {
+            ${request}
+            return client.CreateSubscriptionStream<${this._getResponseClassName(
+              node,
+            )}>(gqlRequest, exceptionHandler);
+          }
+        `;
       }
     }
     throw new Error(`Unexpected operation type: ${node.operation}`);
@@ -475,97 +690,18 @@ export class CSharpOperationsVisitor extends ClientSideBaseVisitor<
 
     this._collectedOperations.push(node);
 
-    const documentVariableName = this.convertName(node, {
-      suffix: this.config.documentVariableSuffix,
-      prefix: this.config.documentVariablePrefix,
-      useTypesPrefix: false,
-    });
-
-    let documentString = '';
-    if (this.config.documentMode !== DocumentMode.external) {
-      const gqlBlock = indentMultiline(this._gql(node), 4);
-      documentString = `${this.config.noExport ? '' : 'public'} static string ${convertSafeName(
-        documentVariableName,
-      )} = @"\n${gqlBlock}";`;
-    }
-
-    const operationType: string = node.operation;
-    const operationTypeSuffix: string =
-      this.config.dedupeOperationSuffix && node.name.value.toLowerCase().endsWith(node.operation)
-        ? ''
-        : !operationType
-        ? ''
-        : operationType;
-
-    const operationResultType: string = this.convertName(node, {
-      suffix: operationTypeSuffix + this._parsedConfig.operationResultSuffix,
-    });
-    const operationVariablesTypes: string = this.convertName(node, {
-      suffix: operationTypeSuffix + 'Variables',
-    });
-
-    const serviceName = `${this.convertName(node)}${this._operationSuffix(operationType)}`;
-    this._operationsToInclude.push({
-      node,
-      documentVariableName,
-      operationType,
-      operationResultType,
-      operationVariablesTypes,
-    });
-
-    const inputSignatures = node.variableDefinitions?.map(v => this._gqlInputSignature(v));
-    const hasInputArgs = !!inputSignatures?.length;
-    const inputArgsHint = hasInputArgs
-      ? `
-      /// <para>Required variables:<br/> { ${inputSignatures
-        .filter(sig => sig.required)
-        .map(sig => sig.signature)
-        .join(', ')} }</para>
-      /// <para>Optional variables:<br/> { ${inputSignatures
-        .filter(sig => !sig.required)
-        .map(sig => sig.signature)
-        .join(', ')} }</para>`
-      : '';
-
-    // Should use ObsoleteAttribute but VS treats warnings as errors which would be super annoying so use remarks comment instead
-    const obsoleteMessage = '/// <remarks>This method is obsolete. Use Request instead.</remarks>';
-
     let typesafeOperations = '';
     if (this.config.typesafeOperation) {
       typesafeOperations = `
-${this._getVariablesClass(node)}
-${this._getResponseClass(node)}
-${this._getOperationMethod(node)}
-`;
+      ${this.getRequestClass(node)}
+      ${this.getResponseClass(node)}
+      public partial class ${this.config.operationsClassName} {
+        ${this.getOperationConcreteMethod(node)}
+      }`;
       typesafeOperations = indentMultiline(typesafeOperations, 3);
     }
 
-    const content = `
-    public class ${serviceName} {
-      /// <summary>
-      /// ${serviceName}.Request ${inputArgsHint}
-      /// </summary>
-      public static GraphQLRequest Request(${hasInputArgs ? 'object variables = null' : ''}) {
-        return new GraphQLRequest {
-          Query = ${this._getDocumentNodeVariable(node, documentVariableName)},
-          OperationName = "${node.name.value}"${
-      hasInputArgs
-        ? `,
-          Variables = variables`
-        : ''
-    }
-        };
-      }
-
-      ${obsoleteMessage}
-      public static GraphQLRequest get${serviceName}() {
-        return Request();
-      }
-      ${this._namedClient(node)}
-      ${documentString}
-      ${typesafeOperations}
-    }
-    `;
+    const content = `${typesafeOperations}`;
     return [content].filter(a => a).join('\n');
   }
 
@@ -586,15 +722,13 @@ ${this._getOperationMethod(node)}
                 return null;
               }
               const inputType = this.resolveFieldType(f.type);
-              const inputTypeName = wrapFieldType(
-                inputType,
-                inputType.listType,
-                'System.Collections.Generic.List',
-              );
+              const inputTypeName = wrapFieldType(inputType, inputType.listType, 'List');
               return indentMultiline(
                 [
                   `[JsonProperty("${f.name.value}")]`,
-                  `public ${inputTypeName} ${convertSafeName(f.name.value)} { get; set; }`,
+                  `public ${inputTypeName} ${convertSafeName(
+                    pascalCase(f.name.value),
+                  )} { get; set; }`,
                 ].join('\n') + '\n',
               );
             })
